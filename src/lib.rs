@@ -205,7 +205,7 @@ pub fn adler32<R: io::Read>(mut reader: R) -> io::Result<u32> {
 #[cfg(test)]
 mod test {
     use rand;
-    use rand::Rng;
+    use rand::{Rng, RngCore};
     use std::io;
 
     use super::{BASE, adler32, RollingAdler32};
