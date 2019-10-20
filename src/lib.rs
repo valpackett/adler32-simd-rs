@@ -8,10 +8,14 @@
 //! The adler32 code has been translated (as accurately as I could manage) from
 //! the zlib implementation.
 
+#[macro_use]
+extern crate cfg_if;
 #[cfg(test)]
 extern crate rand;
 
 use std::io;
+
+mod accel;
 
 // adler32 algorithm and implementation taken from zlib; http://www.zlib.net/
 // It was translated into Rust as accurately as I could manage
@@ -79,6 +83,25 @@ fn do16(adler: &mut u32, sum2: &mut u32, buf: &[u8]) {
     do8(adler, sum2, &buf[8..16]);
 }
 
+/// do length NMAX blocks -- requires just one modulo operation;
+fn do_blocks_baseline(adler: &mut u32, sum2: &mut u32, buf: &[u8]) -> usize {
+    let mut pos = 0;
+    let len = buf.len();
+
+    while pos + NMAX <= len {
+        let end = pos + NMAX;
+        while pos < end {
+            // 16 sums unrolled
+            do16(adler, sum2, &buf[pos..pos + 16]);
+            pos += 16;
+        }
+        *adler %= BASE;
+        *sum2 %= BASE;
+    }
+
+    pos
+}
+
 /// A rolling version of the Adler32 hash, which can 'forget' past bytes.
 ///
 /// Calling remove() will update the hash to the value it would have if that
@@ -87,6 +110,7 @@ fn do16(adler: &mut u32, sum2: &mut u32, buf: &[u8]) {
 pub struct RollingAdler32 {
     a: u32,
     b: u32,
+    do_blocks: accel::DoBlocksFn,
 }
 
 impl Default for RollingAdler32 {
@@ -105,7 +129,11 @@ impl RollingAdler32 {
     pub fn from_value(adler32: u32) -> RollingAdler32 {
         let a = adler32 & 0xFFFF;
         let b = adler32 >> 16;
-        RollingAdler32 { a, b }
+        RollingAdler32 {
+            a,
+            b,
+            do_blocks: accel::accelerated_do_blocks_if_supported().unwrap_or(do_blocks_baseline),
+        }
     }
 
     /// Convenience function initializing a context from the hash of a buffer.
@@ -113,6 +141,11 @@ impl RollingAdler32 {
         let mut hash = RollingAdler32::new();
         hash.update_buffer(buffer);
         hash
+    }
+
+    /// Disable SIMD acceleration if present (e.g. for benchmarking)
+    pub fn force_no_acceleration(&mut self) {
+        self.do_blocks = do_blocks_baseline;
     }
 
     /// Returns the current hash.
@@ -125,8 +158,8 @@ impl RollingAdler32 {
         let byte = u32::from(byte);
         self.a = (self.a + BASE - byte) % BASE;
         self.b = ((self.b + BASE - 1)
-                      .wrapping_add(BASE.wrapping_sub(size as u32)
-                                        .wrapping_mul(byte))) % BASE;
+            .wrapping_add(BASE.wrapping_sub(size as u32).wrapping_mul(byte)))
+            % BASE;
     }
 
     /// Feeds a new `byte` to the algorithm to update the hash.
@@ -159,22 +192,11 @@ impl RollingAdler32 {
             return;
         }
 
-        let mut pos = 0;
-
-        // do length NMAX blocks -- requires just one modulo operation;
-        while pos + NMAX <= len {
-            let end = pos + NMAX;
-            while pos < end {
-                // 16 sums unrolled
-                do16(&mut self.a, &mut self.b, &buffer[pos..pos + 16]);
-                pos += 16;
-            }
-            self.a %= BASE;
-            self.b %= BASE;
-        }
+        let mut pos = unsafe { (self.do_blocks)(&mut self.a, &mut self.b, &buffer) };
 
         // do remaining bytes (less than NMAX, still just one modulo)
-        if pos < len { // avoid modulos if none remaining
+        if pos < len {
+            // avoid modulos if none remaining
             while len - pos >= 16 {
                 do16(&mut self.a, &mut self.b, &buffer[pos..pos + 16]);
                 pos += 16;
@@ -205,10 +227,10 @@ pub fn adler32<R: io::Read>(mut reader: R) -> io::Result<u32> {
 #[cfg(test)]
 mod test {
     use rand;
-    use rand::{Rng, RngCore};
+    use rand::RngCore;
     use std::io;
 
-    use super::{BASE, adler32, RollingAdler32};
+    use super::{adler32, RollingAdler32, BASE};
 
     fn adler32_slow<R: io::Read>(reader: R) -> io::Result<u32> {
         let mut a: u32 = 1;
@@ -238,11 +260,17 @@ mod test {
         do_test(0x024d0127, b"abc");
         do_test(0x29750586, b"message digest");
         do_test(0x90860b20, b"abcdefghijklmnopqrstuvwxyz");
-        do_test(0x8adb150c, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+        do_test(
+            0x8adb150c,
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                               abcdefghijklmnopqrstuvwxyz\
-                              0123456789");
-        do_test(0x97b61069, b"1234567890123456789012345678901234567890\
-                              1234567890123456789012345678901234567890");
+                              0123456789",
+        );
+        do_test(
+            0x97b61069,
+            b"1234567890123456789012345678901234567890\
+                              1234567890123456789012345678901234567890",
+        );
         do_test(0xD6251498, &[255; 64000]);
     }
 
@@ -250,8 +278,12 @@ mod test {
     fn compare() {
         let mut rng = rand::thread_rng();
         let mut data = vec![0u8; 5589];
-        for size in [0, 1, 3, 4, 5, 31, 32, 33, 67,
-                     5550, 5552, 5553, 5568, 5584, 5589].iter().cloned() {
+        for size in [
+            0, 1, 3, 4, 5, 31, 32, 33, 67, 5550, 5552, 5553, 5568, 5584, 5589,
+        ]
+        .iter()
+        .cloned()
+        {
             rng.fill_bytes(&mut data[..size]);
             let r1 = io::Cursor::new(&data[..size]);
             let r2 = r1.clone();
@@ -288,7 +320,7 @@ mod test {
         let w = 65536;
         assert!(w as u32 > BASE);
 
-        let mut bytes = vec![0; w*3];
+        let mut bytes = vec![0; w * 3];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = i as u8;
         }

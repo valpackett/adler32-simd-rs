@@ -1,11 +1,11 @@
 #[macro_use]
 extern crate bencher;
-extern crate rand;
 extern crate adler32;
+extern crate rand;
 
+use adler32::RollingAdler32;
 use bencher::Bencher;
 use rand::{thread_rng, RngCore};
-use adler32::RollingAdler32;
 
 fn bench(b: &mut Bencher, size: usize, adler: &mut RollingAdler32) {
     let mut in_bytes = vec![0u8; size];
@@ -18,10 +18,35 @@ fn bench(b: &mut Bencher, size: usize, adler: &mut RollingAdler32) {
     b.bytes = size as u64;
 }
 
-fn bench_kb_baseline(b: &mut Bencher) {
-    bench(b, 1024, &mut RollingAdler32::new())
+fn bench_baseline(b: &mut Bencher, size: usize) {
+    let mut adl = RollingAdler32::new();
+    adl.force_no_acceleration();
+    bench(b, size, &mut adl)
 }
 
-benchmark_group!(bench_default, bench_kb_baseline);
+fn bench_accel(b: &mut Bencher, size: usize) {
+    bench(b, size, &mut RollingAdler32::new())
+}
+
+fn bench_512b_baseline(b: &mut Bencher) {
+    bench_baseline(b, 512)
+}
+fn bench_512b_accel(b: &mut Bencher) {
+    bench_accel(b, 512)
+}
+fn bench_100kb_baseline(b: &mut Bencher) {
+    bench_baseline(b, 1024 * 100)
+}
+fn bench_100kb_accel(b: &mut Bencher) {
+    bench_accel(b, 1024 * 100)
+}
+
+benchmark_group!(
+    bench_default,
+    bench_512b_baseline,
+    bench_512b_accel,
+    bench_100kb_baseline,
+    bench_100kb_accel
+);
 
 benchmark_main!(bench_default);
